@@ -1,96 +1,157 @@
 import argparse
-import json
 import socket
 import threading
+import time
 
-max_msg_size = 10
 
-def getMaxMsgSize() -> int:
-    return 10  # Example fixed size
+# ------------------- Server Logic ------------------- #
 
-def serve(host: str, port: int):
+def handle_client(conn: socket.socket, addr, config):
+    print(f"[server] connected to {addr}")
+
+    max_msg_size = config["maximum_message_size"]
+    dynamic = config["dynamic_message_size"]
+
+    segments = {}
+    highest_seq = -1
+    received_fin = False
+
+    with conn:
+        buffer = b""
+
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+
+            buffer += data
+
+            while b"\n" in buffer:
+                line, _, buffer = buffer.partition(b"\n")
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                # ---------- Handshake ----------
+                if line == b"SIN":
+                    conn.sendall(b"SIN/ACK\n")
+
+                elif line == b"ACK":
+                    continue
+
+                # ---------- Max Message Size ----------
+                elif line == b"GetMaxMsgSize":
+                    resp = f"MaxMsgSize:{max_msg_size}\n".encode()
+                    conn.sendall(resp)
+                    print(f"[server] sent MaxMsgSize {max_msg_size}")
+
+                # ---------- FIN ----------
+                elif line == b"FIN":
+                    received_fin = True
+                    print("[server] FIN received")
+
+                # ---------- Data Segment ----------
+                elif line.startswith(b"M"):
+                    header, payload = line[1:].split(b":", 1)
+                    seq = int(header)
+
+                    segments[seq] = payload
+                    print(f"[server] received segment {seq} ({len(payload)} bytes)")
+
+                    while highest_seq + 1 in segments:
+                        highest_seq += 1
+
+                    # Dynamic max message size
+                    ack = f"ACK:{highest_seq}"
+                    if dynamic:
+                        max_msg_size = max(4, max_msg_size - 1)
+                        ack += f":MAX:{max_msg_size}"
+                    try:
+                        if not received_fin:
+                            conn.sendall((ack + "\n").encode())
+                    except OSError:
+                        print("[server] client closed connection, stopping ACKs")
+                        return
+
+
+                # ---------- Completion ----------
+                if received_fin and highest_seq + 1 == len(segments):
+                    full_message = b"".join(segments[i] for i in range(len(segments)))
+                    print("\n[server] COMPLETE MESSAGE RECEIVED:")
+                    try:
+                        print(full_message.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        print(full_message)
+                    print("[server] end of message\n")
+                    return
+
+
+# ------------------- Config Parsing ------------------- #
+
+def read_config(f):
+    config = {}
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        key, value = line.split(":", 1)
+
+        # נרמול מלא
+        key = key.strip().lower().replace(" ", "_").replace("\ufeff", "")
+        value = value.strip()
+
+        if key == "dynamic_message_size":
+            config[key] = value.lower() == "true"
+        elif value.isdigit():
+            config[key] = int(value)
+
+    return config
+
+
+
+# ------------------- Server Setup ------------------- #
+
+def serve(host, port, config):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
-        s.listen(16)
+        s.listen(5)
+
         print(f"[server] listening on {host}:{port}")
+
         while True:
             conn, addr = s.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-
-def handle_client(conn: socket.socket, addr):
-    segments = {}
-    highest_seq = -1
-    with conn:
-        try:
-            buff = b""
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-
-                buff += chunk
-                while b"\n" in buff:
-                    line, _, buff = buff.partition(b"\n")
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    if line.startswith(b"SIN"):
-                        # Handle SIN handshake
-                        print("[server] received SIN from", addr)
-                        print("[server] sending SIN/ACK to", addr)
-                        conn.sendall(b"SIN/ACK\n")
-                    elif line.startswith(b"GetMaxMsgSize"):
-                        # Handle GetMaxMsgSize request
-                        max_msg_size = getMaxMsgSize()  # Example fixed size
-                        resp = "MaxMsgSize: " + str(max_msg_size)
-                        print(f"[server] sending MaxMsgSize {max_msg_size} to", addr)
-                        conn.sendall(resp.encode("utf-8") + b"\n")
-                    elif line.startswith(b"M"):
-                        # Handle message segments
-                        seq_num_str, segment_data = line[1:].split(b":", 1)
-                        seq_num = int(seq_num_str)
-                        segments[seq_num] = segment_data.decode("utf-8")
-                        print(f"Received segment: {segment_data} (seq: {seq_num})")
-                        while highest_seq + 1 in segments:
-                            highest_seq += 1
-                        print(f"sending ACK: {highest_seq}")
-                        conn.sendall(f"ACK:{highest_seq}\n".encode("utf-8"))
-                        
-                        
+            threading.Thread(
+                target=handle_client,
+                args=(conn, addr, config),
+                daemon=True
+            ).start()
 
 
-        except Exception as e:
-            try:
-                err = {"ok": False, "error": f"Server exception: {e}"}
-                conn.sendall((json.dumps(err, ensure_ascii=False) + "\n").encode("utf-8"))
-            except Exception:
-                pass
-
-def readFile(f) -> dict:
-    content = f.read()
-    return json.loads(content)
+# ------------------- Main ------------------- #
 
 def main():
-    ap = argparse.ArgumentParser(description="JSON TCP server (calc/gpt) — student skeleton")
+    ap = argparse.ArgumentParser(description="Reliable TCP Server (Assignment 3)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5555)
-    ap.add_argument("--config", type=str, default=None, help="Path to config file (if not given, runs in interactive mode)")
+    ap.add_argument("--config", type=str)
+
     args = ap.parse_args()
-    if args.config is None:
-        print("No config file provided. Running in interactive mode.")
-        max_msg_size = int(input("Enter max message size in bytes: ").strip())
+
+    if args.config:
+        with open(args.config, "r") as f:
+            config = read_config(f)
     else:
-        try:
-            with open(args.config, "r", encoding="utf-8") as f:
-                config = readFile(f)
-                max_msg_size = config.get("max_message_size", 10)
-        except Exception as e:
-            print(f"Error reading config file: {e}")
-            return
-        
-    serve(args.host, args.port)
+        config = {
+            "maximum_message_size": int(input("Max message size (bytes): ").strip()),
+            "dynamic_message_size": input("Dynamic message size? (y/n): ").lower() == "y"
+        }
+    print("SERVER CONFIG:", config)
+
+    serve(args.host, args.port, config)
+
 
 if __name__ == "__main__":
     main()

@@ -1,150 +1,163 @@
-import argparse, socket, sys
+import argparse
+import socket
+import sys
 import time
 
 
+# ------------------- Client Logic ------------------- #
 
+def handle_client(host, port, config):
+    message_path = config["message"]
+    window_size = config["window_size"]
+    timeout = config["timeout"]          # seconds
+    dynamic = config["dynamic_message_size"]
 
-
-
-    
-# ------------------- מצב אינטראקטיבי ------------------- #
-def handle_client(host, port,config):
-    
-    message = config.get("message", "message.txt")
-    timeOut = config.get("time_out", 500)  # milliseconds
-    windowZise = config.get("window_size", 4)
-    dynamic = config.get("dynamic_window", False)
+    with open(message_path, "rb") as f:
+        message_bytes = f.read()
 
     with socket.create_connection((host, port)) as s:
-        s.sendall(b"SIN\n")
-        s.settimeout(timeOut / 1000)
+        s.settimeout(timeout)
+
+        # ---------- Handshake ----------
         while True:
+            s.sendall(b"SIN\n")
             try:
-                buff = s.recv(4096)
-                if b"SIN/ACK" in buff:
+                if b"SIN/ACK" in s.recv(1024):
                     s.sendall(b"ACK\n")
                     break
             except socket.timeout:
-                s.sendall(b"SIN\n")
-        
-        s.sendall(b"GetMaxMsgSize\n")
+                continue
+
+        # ---------- Get max message size ----------
         while True:
+            s.sendall(b"GetMaxMsgSize\n")
             try:
-                buff = s.recv(4096)
-                if b"MaxMsgSize" in buff:
-                    max_msg_size = int(buff.split(b":")[1].strip())
+                resp = s.recv(1024)
+                if resp.startswith(b"MaxMsgSize:"):
+                    max_msg_size = int(resp.split(b":")[1])
                     break
             except socket.timeout:
-                s.sendall(b"GetMaxMsgSize\n")
+                continue
 
-        print(f"Max message size from server: {max_msg_size} bytes")
+        print(f"[Client] Initial max message size = {max_msg_size} bytes")
 
-        with open(message, "r", encoding="utf-8") as f:
-            content = f.read()
-            segments = segment_message(content, max_msg_size)
+        # ---------- Segmentation ----------
+        segments = segment_bytes(message_bytes, max_msg_size)
 
         base = 0
-        seq = 0
-        acked = -1
+        next_seq = 0
+        last_ack = -1
+        timer_start = None
 
         while base < len(segments):
-            while seq - base < windowZise and seq < len(segments):
-                msg = "M"+str(seq)+":"+segments[seq]
-                print(f"Sending segment {seq}: "+str(segments[seq]))
-                s.sendall(msg.encode("utf-8") + b"\n")
-                seq += 1
+
+            # Send window
+            while next_seq < len(segments) and next_seq - base < window_size:
+                payload = segments[next_seq]
+                header = f"M{next_seq}:".encode()
+                s.sendall(header + payload + b"\n")
+                print(f"[Client] Sent segment {next_seq}")
+                if base == next_seq:
+                    timer_start = time.time()
+                next_seq += 1
 
             try:
-                buff = s.recv(4096)
-                for line in buff.split(b"\n"):
-                    line = line.strip()
-                    if not line:
+                s.settimeout(timeout)
+                resp = s.recv(4096)
+
+                for line in resp.split(b"\n"):
+                    if not line.startswith(b"ACK:"):
                         continue
-                    if line.startswith(b"ACK:"):
-                        print("Received " + line.decode("utf-8"))
-                        print(f"current window {base} to {seq - 1}")
-                        ack_num = int(line.split(b":", 1)[1].strip())
-                        acked = max(acked, ack_num)
-                            
+
+                    parts = line.decode().split(":")
+                    ack_num = int(parts[1])
+                    last_ack = max(last_ack, ack_num)
+                    print(f"[Client] Received ACK {ack_num}")
+
+                    # Dynamic max message size
+                    if dynamic and len(parts) == 4 and parts[2] == "MAX":
+                        new_max = int(parts[3])
+                        if new_max != max_msg_size:
+                            print(f"[Client] New max_msg_size = {new_max}")
+                            max_msg_size = new_max
+                            remaining = b"".join(segments[last_ack+1:])
+                            segments = segment_bytes(remaining, max_msg_size)
+                            base = 0
+                            next_seq = 0
+                            last_ack = -1
+                            timer_start = None
+                            break
+
+                    base = last_ack + 1
+                    if base == next_seq:
+                        timer_start = None
+                    else:
+                        timer_start = time.time()
+
             except socket.timeout:
-                for i in range(base, seq):
-                    msg = "M" + str(i) + ":" + segments[i]
-                    print(f"Timeout -> Resending segment {i}")
-                    s.sendall(msg.encode("utf-8") + b"\n")
+                print("[Client] Timeout -> retransmitting window")
+                next_seq = base
+                timer_start = time.time()
 
-            if dynamic:
-                windowZise = min(windowZise + 1, 10)
+        # ---------- End of transmission ----------
+        s.sendall(b"FIN\n")
+        print("[Client] Transmission complete")
 
-            base = max(0, acked + 1)
-        
 
-def segment_message(message: str, max_size: int) -> list:
-    segments = []
-    for i in range(0, len(message), max_size):
-        segments.append(message[i:i + max_size])
-    return segments
+# ------------------- Utilities ------------------- #
 
-def readFile(f) -> dict:
+def segment_bytes(data: bytes, max_size: int):
+    return [data[i:i+max_size] for i in range(0, len(data), max_size)]
+
+
+def readFile(f):
     config = {}
     for line in f:
         line = line.strip()
-        if not line or line.startswith('#'):
+        if not line or line.startswith("#"):
             continue
-        if ':' in line:
-            key, value = line.split(':', 1)
-            key = key.strip().lower().replace(' ', '_')
-            value = value.strip()
-            # Convert to appropriate types
-            if value.lower() in ('true', 'false'):
-                config[key] = value.lower() == 'true'
-            elif value.isdigit():
-                config[key] = int(value)
-            else:
-                config[key] = value
+
+        key, value = line.split(":", 1)
+        key = key.strip().lower().replace(" ", "_")
+        value = value.strip()
+
+        if key == "dynamic_message_size":
+            config[key] = value.lower() == "true"
+        elif key == "message":
+            config[key] = value.strip('"')
+        elif value.isdigit():
+            config[key] = int(value)
+
     return config
 
-def interactive_config(host: str, port: int):
-    print("Entering interactive mode\n")
-    message = input("Enter path to message file: ").strip()
-    windowZise = int(input("Enter window size: ").strip())
-    timeOut = int(input("Enter timeout (ms): ").strip())
-    dynamic = input("Dynamic window size? (y/n): ").strip().lower() == 'y'
 
+def interactive_config(host, port):
     config = {
-        "message": message,
-        "window_size": windowZise,
-        "timeout_ms": timeOut,
-        "dynamic_window": dynamic
+        "message": input("Message file path: ").strip(),
+        "window_size": int(input("Window size: ").strip()),
+        "timeout": int(input("Timeout (seconds): ").strip()),
+        "dynamic_message_size": input("Dynamic message size? (y/n): ").lower() == "y"
     }
-
     handle_client(host, port, config)
 
-def configure_client(host: str, port: int, requests: dict):
-    handle_client(host, port, requests)
+
+# ------------------- Main ------------------- #
 
 def main():
-    ap = argparse.ArgumentParser(description="Client (Windowed messaging over JSON TCP)")
+    ap = argparse.ArgumentParser(description="Reliable client over TCP")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5555)
+    ap.add_argument("--config", type=str)
 
-    ap.add_argument("--config", type=str, default=None,
-                    help="Path to JSON config file with requests (if not given, runs in interactive mode)")
-    
     args = ap.parse_args()
 
-    if args.config is None:
-        interactive_config(args.host, args.port)
-
+    if args.config:
+        with open(args.config, "r") as f:
+            config = readFile(f)
     else:
-        try:
-            with open(args.config, "r", encoding="utf-8") as f:
-                requests = readFile(f)
-                configure_client(args.host, args.port, requests)
-        except Exception as e:
-            print(f"Error reading config file: {e}", file=sys.stderr)
-            sys.exit(1)
+        return interactive_config(args.host, args.port)
 
-       
+    handle_client(args.host, args.port, config)
 
 
 if __name__ == "__main__":

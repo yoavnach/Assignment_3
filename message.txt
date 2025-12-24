@@ -1,0 +1,4 @@
+Hello,
+This is a test message for Assignment 3.
+We are testing reliable transport with sliding window,
+ACKs, retransmissions and dynamic message size.
