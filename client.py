@@ -13,7 +13,9 @@ def handle_client(host, port, config):
     dynamic = config["dynamic_message_size"]
 
     with open(message_path, "rb") as f:
-        message_bytes = f.read()
+        content = f.read()
+        message_bytes = content.replace(b"\r\n", b" ").replace(b"\n", b" ")
+
 
     with socket.create_connection((host, port)) as s:
         s.settimeout(timeout)
@@ -48,15 +50,20 @@ def handle_client(host, port, config):
         next_seq = 0
         last_ack = -1
         timer_start = None
+        
+        sequence_offset = 0
 
         while base < len(segments):
 
             # Send window
             while next_seq < len(segments) and next_seq - base < window_size:
                 payload = segments[next_seq]
-                header = f"M{next_seq}:".encode()
+                global_seq = next_seq + sequence_offset
+                header = f"M{global_seq}:".encode()
+                
                 s.sendall(header + payload + b"\n")
-                print(f"[Client] Sent segment {next_seq}")
+                print(f"[Client] Sent segment {global_seq}")
+                
                 if base == next_seq:
                     timer_start = time.time()
                 next_seq += 1
@@ -70,18 +77,29 @@ def handle_client(host, port, config):
                         continue
 
                     parts = line.decode().split(":")
-                    ack_num = int(parts[1])
-                    last_ack = max(last_ack, ack_num)
-                    print(f"[Client] Received ACK {ack_num}")
+                    global_ack = int(parts[1])
+                    
+                    ack_num = global_ack - sequence_offset
+                    
+                    if ack_num < last_ack:
+                        continue
 
-                    # Dynamic max message size
+                    last_ack = max(last_ack, ack_num)
+                    print(f"[Client] Received ACK {global_ack}")
+
+                    # Dynamic max message size logic
                     if dynamic and len(parts) == 4 and parts[2] == "MAX":
                         new_max = int(parts[3])
                         if new_max != max_msg_size:
                             print(f"[Client] New max_msg_size = {new_max}")
                             max_msg_size = new_max
+                            
                             remaining = b"".join(segments[last_ack+1:])
+                            
                             segments = segment_bytes(remaining, max_msg_size)
+                            
+                            sequence_offset += (last_ack + 1)
+                            
                             base = 0
                             next_seq = 0
                             last_ack = -1

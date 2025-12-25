@@ -28,7 +28,6 @@ def handle_client(conn: socket.socket, addr, config):
 
             while b"\n" in buffer:
                 line, _, buffer = buffer.partition(b"\n")
-                line = line.strip()
 
                 if not line:
                     continue
@@ -53,23 +52,27 @@ def handle_client(conn: socket.socket, addr, config):
 
                 # ---------- Data Segment ----------
                 elif line.startswith(b"M"):
-                    header, payload = line[1:].split(b":", 1)
-                    seq = int(header)
-
-                    segments[seq] = payload
-                    print(f"[server] received segment {seq} ({len(payload)} bytes)")
-
-                    while highest_seq + 1 in segments:
-                        highest_seq += 1
-
-                    # Dynamic max message size
-                    ack = f"ACK:{highest_seq}"
-                    if dynamic:
-                        max_msg_size = max(4, max_msg_size - 1)
-                        ack += f":MAX:{max_msg_size}"
                     try:
+                        header, payload = line[1:].split(b":", 1)
+                        seq = int(header)
+
+                        segments[seq] = payload
+                        print(f"[server] received segment {seq} ({len(payload)} bytes)")
+
+                        while highest_seq + 1 in segments:
+                            highest_seq += 1
+
+                        # Dynamic max message size
+                        ack = f"ACK:{highest_seq}"
+                        if dynamic:
+                            max_msg_size = max(4, max_msg_size - 1)
+                            ack += f":MAX:{max_msg_size}"
+                        
                         if not received_fin:
                             conn.sendall((ack + "\n").encode())
+                            
+                    except ValueError:
+                        print(f"[server] Error parsing line: {line}")
                     except OSError:
                         print("[server] client closed connection, stopping ACKs")
                         return
@@ -98,7 +101,6 @@ def read_config(f):
 
         key, value = line.split(":", 1)
 
-        # נרמול מלא
         key = key.strip().lower().replace(" ", "_").replace("\ufeff", "")
         value = value.strip()
 
@@ -133,7 +135,7 @@ def serve(host, port, config):
 # ------------------- Main ------------------- #
 
 def main():
-    ap = argparse.ArgumentParser(description="Reliable TCP Server (Assignment 3)")
+    ap = argparse.ArgumentParser(description="Reliable TCP Server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5555)
     ap.add_argument("--config", type=str)
