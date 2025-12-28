@@ -1,16 +1,18 @@
 import argparse
+import random
 import socket
 import threading
 import time
 
+lossProbability = 0.1  # probability of dropping a packet
 
 # ------------------- Server Logic ------------------- #
 
-def handle_client(conn: socket.socket, addr, config):
+def handle_client(conn: socket.socket, addr):
     print(f"[server] connected to {addr}")
 
-    max_msg_size = config["maximum_message_size"]
-    dynamic = config["dynamic_message_size"]
+    max_msg_size = 1  # Default max message size
+    dynamic = False  # Default dynamic behavior
 
     segments = {}
     highest_seq = -1
@@ -32,6 +34,10 @@ def handle_client(conn: socket.socket, addr, config):
                 if not line:
                     continue
 
+                if random.random() < lossProbability:
+                    print("[server] Simulating packet loss")
+                    print("[server] Dropped line:", line)
+                    continue
                 # ---------- Handshake ----------
                 if line == b"SIN":
                     conn.sendall(b"SIN/ACK\n")
@@ -40,7 +46,11 @@ def handle_client(conn: socket.socket, addr, config):
                     continue
 
                 # ---------- Max Message Size ----------
-                elif line == b"GetMaxMsgSize":
+                elif line.startswith(b"GetMaxMsgSize"):
+                    rest = line.split(b":", 1)[1]
+                    req_b, dyn_b = rest.split(b",", 1)
+                    max_msg_size = int(req_b)
+                    dynamic = dyn_b == b"True"
                     resp = f"MaxMsgSize:{max_msg_size}\n".encode()
                     conn.sendall(resp)
                     print(f"[server] sent MaxMsgSize {max_msg_size}")
@@ -49,6 +59,7 @@ def handle_client(conn: socket.socket, addr, config):
                 elif line == b"FIN":
                     received_fin = True
                     print("[server] FIN received")
+                    conn.sendall(b"ACK:\n")
 
                 # ---------- Data Segment ----------
                 elif line.startswith(b"M"):
@@ -65,7 +76,7 @@ def handle_client(conn: socket.socket, addr, config):
                         # Dynamic max message size
                         ack = f"ACK:{highest_seq}"
                         if dynamic:
-                            max_msg_size = max(4, max_msg_size - 1)
+                            max_msg_size = max_msg_size+1
                             ack += f":MAX:{max_msg_size}"
                         
                         if not received_fin:
@@ -90,32 +101,11 @@ def handle_client(conn: socket.socket, addr, config):
                     return
 
 
-# ------------------- Config Parsing ------------------- #
-
-def read_config(f):
-    config = {}
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        key, value = line.split(":", 1)
-
-        key = key.strip().lower().replace(" ", "_").replace("\ufeff", "")
-        value = value.strip()
-
-        if key == "dynamic_message_size":
-            config[key] = value.lower() == "true"
-        elif value.isdigit():
-            config[key] = int(value)
-
-    return config
-
 
 
 # ------------------- Server Setup ------------------- #
 
-def serve(host, port, config):
+def serve(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
@@ -127,7 +117,7 @@ def serve(host, port, config):
             conn, addr = s.accept()
             threading.Thread(
                 target=handle_client,
-                args=(conn, addr, config),
+                args=(conn, addr),
                 daemon=True
             ).start()
 
@@ -138,21 +128,11 @@ def main():
     ap = argparse.ArgumentParser(description="Reliable TCP Server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5555)
-    ap.add_argument("--config", type=str)
 
     args = ap.parse_args()
 
-    if args.config:
-        with open(args.config, "r") as f:
-            config = read_config(f)
-    else:
-        config = {
-            "maximum_message_size": int(input("Max message size (bytes): ").strip()),
-            "dynamic_message_size": input("Dynamic message size? (y/n): ").lower() == "y"
-        }
-    print("SERVER CONFIG:", config)
 
-    serve(args.host, args.port, config)
+    serve(args.host, args.port)
 
 
 if __name__ == "__main__":

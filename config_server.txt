@@ -1,4 +1,0 @@
-maximum message size: 20
-dynamic message size: false
-
-

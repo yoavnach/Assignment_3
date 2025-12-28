@@ -1,0 +1,7 @@
+message: message.txt
+maximum message size: 20
+window_size: 4
+timeout: 3
+dynamic message size: true
+
+
